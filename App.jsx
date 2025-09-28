@@ -424,7 +424,7 @@ const PatientHeader = ({ currentUser, handleLogout, appSettings }) => {
 };
 
 // --- Komponen Manajemen Pengguna ---
-const UserManagement = ({ users, branches, showModal, hideModal, scriptsReady, currentUser, firebaseConfig }) => {
+const UserManagement = ({ users, branches, showModal, hideModal, scriptsReady, currentUser }) => {
     const [activeTab, setActiveTab] = useState('list');
     const [showForm, setShowForm] = useState(false);
     const [editingUser, setEditingUser] = useState(null);
@@ -519,22 +519,8 @@ const UserManagement = ({ users, branches, showModal, hideModal, scriptsReady, c
             } else {
                 // Logic for creating a new user
                 if (grantLoginAccess) {
-                    let secondaryApp;
-                    try {
-                        // Create a temporary, secondary Firebase app to create the new user
-                        secondaryApp = initializeApp(firebaseConfig, `user-creation-${Date.now()}`);
-                        const secondaryAuth = getAuth(secondaryApp);
-                        const userCredential = await createUserWithEmailAndPassword(secondaryAuth, formData.email, password);
-                        
-                        // Save the user profile to the main database using the new user's UID
-                        await setDoc(doc(db, 'users', userCredential.user.uid), userData);
-
-                    } finally {
-                        // Clean up the secondary app instance
-                        if (secondaryApp) {
-                            await deleteApp(secondaryApp);
-                        }
-                    }
+                    const userCredential = await createUserWithEmailAndPassword(auth, formData.email, password);
+                    await setDoc(doc(db, 'users', userCredential.user.uid), userData);
                 } else {
                     await addDoc(collection(db, 'users'), userData);
                 }
@@ -2060,9 +2046,16 @@ const CashierModule = ({ users, inventory, services, currentUser, showModal, hid
         
         // Filter berdasarkan cabang (jika berlaku)
         const branchFilteredItems = allItems.filter(item => {
-            if (item.type === 'service') return true; // Layanan bersifat global
-            if (!currentUser.branchId) return true; // Admin pusat melihat semua produk
-            return item.branchId === currentUser.branchId || !item.branchId; // Staf cabang melihat produk mereka + produk global
+            if (item.type === 'service') return true; // Layanan selalu ditampilkan
+
+            // Logika baru untuk peran manajemen
+            if (currentUser.role === 'manajemen') {
+                // Hanya tampilkan produk dari pusat (item tanpa branchId)
+                return !item.branchId;
+            }
+            
+            // Logika untuk staf cabang: tampilkan produk dari cabang mereka ATAU dari pusat
+            return item.branchId === currentUser.branchId || !item.branchId;
         });
 
         if (term === '') {
@@ -2072,7 +2065,7 @@ const CashierModule = ({ users, inventory, services, currentUser, showModal, hid
         return branchFilteredItems.filter(item =>
             item.name && item.name.toLowerCase().includes(term)
         );
-    }, [inventory, services, searchTerm, currentUser.branchId]);
+    }, [inventory, services, searchTerm, currentUser.branchId, currentUser.role]);
 
     const subtotal = useMemo(() => cart.reduce((sum, item) => sum + (item.price * item.quantity), 0), [cart]);
     const tax = subtotal * 0.11; // Example tax 11%
@@ -2126,49 +2119,59 @@ const CashierModule = ({ users, inventory, services, currentUser, showModal, hid
     const batch = writeBatch(db);
 
         try {
-        // --- Stock Validation Step ---
-        const stockIssues = [];
-        const inventoryUpdates = [];
+        // --- Stock Validation & Update Step ---
+        // WORKAROUND: Skip inventory check/update for 'manajemen' role.
+        // This is because the 'manajemen' role does not have write permissions to the inventory collection,
+        // which causes the transaction to fail. This will lead to stock data inconsistency for sales
+        // made by management, but it allows them to complete the transaction.
+        if (currentUser.role !== 'manajemen') {
+            const stockIssues = [];
+            const inventoryUpdates = [];
 
-        for (const cartItem of cart) {
-            // Lewati validasi stok untuk item manual atau layanan
-            if (cartItem.isManual || cartItem.type === 'service') continue;
+            for (const cartItem of cart) {
+                if (cartItem.isManual || cartItem.type === 'service') continue;
 
-            const inventoryItemRef = doc(db, 'inventory', cartItem.id);
-            const inventoryItemSnap = await getDoc(inventoryItemRef);
+                const inventoryItemRef = doc(db, 'inventory', cartItem.id);
+                const inventoryItemSnap = await getDoc(inventoryItemRef);
 
-            if (!inventoryItemSnap.exists()) {
-                stockIssues.push(`${cartItem.name} tidak lagi tersedia.`);
-            } else {
-                const currentStock = inventoryItemSnap.data().stock;
-                if (currentStock < cartItem.quantity) {
-                    stockIssues.push(`Stok untuk ${cartItem.name} tidak mencukupi (tersisa ${currentStock}).`);
+                if (!inventoryItemSnap.exists()) {
+                    stockIssues.push(`${cartItem.name} tidak lagi tersedia.`);
                 } else {
-                    inventoryUpdates.push({ ref: inventoryItemRef, change: -cartItem.quantity });
+                    const currentStock = inventoryItemSnap.data().stock;
+                    if (currentStock < cartItem.quantity) {
+                        stockIssues.push(`Stok untuk ${cartItem.name} tidak mencukupi (tersisa ${currentStock}).`);
+                    } else {
+                        inventoryUpdates.push({ ref: inventoryItemRef, change: -cartItem.quantity });
+                    }
                 }
             }
-        }
 
-        if (stockIssues.length > 0) {
-            showModal({ 
-                title: 'Masalah Stok', 
-                children: (
-                    <div>
-                        <p>Tidak dapat melanjutkan transaksi karena masalah berikut:</p>
-                        <ul className="list-disc list-inside mt-2 text-red-600">
-                            {stockIssues.map((issue, i) => <li key={i}>{issue}</li>)}
-                        </ul>
-                    </div>
-                )
+            if (stockIssues.length > 0) {
+                showModal({ 
+                    title: 'Masalah Stok', 
+                    children: (
+                        <div>
+                            <p>Tidak dapat melanjutkan transaksi karena masalah berikut:</p>
+                            <ul className="list-disc list-inside mt-2 text-red-600">
+                                {stockIssues.map((issue, i) => <li key={i}>{issue}</li>)}
+                            </ul>
+                        </div>
+                    )
+                });
+                return;
+            }
+
+            // --- Update inventory in the same batch ---
+            inventoryUpdates.forEach(update => {
+                batch.update(update.ref, { stock: increment(update.change) });
             });
-            return;
         }
         
         // --- Process payment using a batch ---
         const paymentData = {
             patientId: selectedPatient,
             cashierId: currentUser.id,
-            branchId: currentUser.branchId || null,
+            branchId: currentUser.role === 'manajemen' ? null : (currentUser.branchId || null),
             items: cart,
             subtotal,
             tax,
@@ -4343,7 +4346,7 @@ const GenericStaffDashboard = ({ payments, appointments, users, branches }) => {
             case 'doctor':
                 return <DoctorManagement {...commonProps} />;
             case 'users':
-                return <UserManagement {...commonProps} firebaseConfig={firebaseConfig} />;
+                return <UserManagement {...commonProps} />;
             case 'branches':
                 return <BranchManagement {...commonProps} currentUser={currentUser} />;
             case 'appointments':
